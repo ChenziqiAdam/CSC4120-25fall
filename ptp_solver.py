@@ -829,7 +829,8 @@ def ptp_solver(G: nx.DiGraph, H: list, alpha: float):
     node_num = G.number_of_nodes()
     use_ILP = node_num <= 20
     repeat_times = 20
-    verbose = True
+    # verbose = True
+    verbose = False
 
     solutions = []
 
