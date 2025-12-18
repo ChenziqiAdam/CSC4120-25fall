@@ -1,873 +1,883 @@
+import math
+import random
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
 import networkx as nx
 import numpy as np
-import random
-import math
 import pulp as pl
+
 from student_utils import analyze_solution
 
 
-def ptp_solver_greedy(G: nx.DiGraph, H: list, alpha: float):
-    """
-    PTP solver.
+# -----------------------------
+# Shortest path cache utilities
+# -----------------------------
 
-    Parameters:
-        G (nx.DiGraph): A NetworkX graph representing the city.
-            This directed graph is equivalent to an undirected one by construction.
-        H (list): A list of home nodes.
-        alpha (float): The coefficient for calculating cost.
+@dataclass(frozen=True)
+class _EvalMetrics:
+    """Cached evaluation results for a key-node tour."""
+    full_tour: Tuple[int, ...]
+    visited: frozenset
+    driving_len: float
+    walking_allowed: float
+    infeasibility: int
+    walking_relaxed: float
+
+
+class ShortestPathCache:
+    """
+    Cache all-pairs shortest-path distances + per-source predecessor trees
+    to allow fast path reconstruction without storing all paths explicitly.
+    Assumes nodes are labeled 0..n-1 (as in the course project).
+    """
+
+    def __init__(self, G: nx.DiGraph):
+        self.G = G
+        self.n = G.number_of_nodes()
+        # Use an undirected view for neighborhood (PTP defines neighbors in the underlying city graph)
+        self._UG = G.to_undirected(as_view=True)
+
+        # Precompute predecessors and distances using Dijkstra from every source.
+        # This is typically much cheaper than Floyd-Warshall on sparse graphs and avoids path explosion.
+        # NetworkX function availability differs across versions; we support both APIs.
+        self._pred: List[Dict[int, List[int]]] = [dict() for _ in range(self.n)]
+        self._dist: np.ndarray = np.full((self.n, self.n), np.inf, dtype=float)
+
+        # Project graphs are labeled 0..n-1; keep a defensive check for clarity.
+        nodes = list(G.nodes())
+        if any((not isinstance(v, int) or v < 0 or v >= self.n) for v in nodes):
+            raise ValueError(
+                "This solver expects graph nodes to be integer labels in [0, n-1]. "
+                f"Got node labels: {sorted(nodes)[:10]}{'...' if len(nodes) > 10 else ''}"
+            )
+
+        try:
+            # Newer NetworkX (some versions) expose this all-pairs convenience iterator.
+            iterator = nx.all_pairs_dijkstra_predecessor_and_distance(G, weight="weight")
+            for src, (pred, dist) in iterator:
+                self._pred[src] = pred
+                for tgt, d in dist.items():
+                    self._dist[src, tgt] = float(d)
+        except AttributeError:
+            # Compatibility path for older NetworkX: run single-source Dijkstra for each source.
+            for src in range(self.n):
+                pred, dist = nx.dijkstra_predecessor_and_distance(G, src, weight="weight")
+                self._pred[src] = pred
+                for tgt, d in dist.items():
+                    self._dist[src, tgt] = float(d)
+
+        # Cache reconstructed paths (u, v) -> tuple(path nodes)
+        @lru_cache(maxsize=200_000)
+        def _path(u: int, v: int) -> Optional[Tuple[int, ...]]:
+            if u == v:
+                return (u,)
+            # Backtrack from v to u using predecessor tree rooted at u
+            pred_u = self._pred[u]
+            cur = v
+            rev = [cur]
+            while cur != u:
+                plist = pred_u.get(cur)
+                if not plist:
+                    return None
+                cur = plist[0]
+                rev.append(cur)
+            rev.reverse()
+            return tuple(rev)
+
+        self._path = _path
+
+    def neighbors(self, u: int) -> List[int]:
+        return list(self._UG.neighbors(u))
+
+    def dist(self, u: int, v: int) -> float:
+        return float(self._dist[u, v])
+
+    def path(self, u: int, v: int) -> Optional[List[int]]:
+        p = self._path(u, v)
+        return list(p) if p is not None else None
+
+
+# -----------------------------
+# PTP objective helpers
+# -----------------------------
+
+def _candidate_nodes(G: nx.DiGraph, H: Sequence[int], sp: ShortestPathCache) -> List[int]:
+    """
+    Restrict the move set to nodes that can matter:
+    {0} ∪ H ∪ N(H). Because we drive on metric shortest-path distances,
+    inserting arbitrary extra waypoints cannot reduce driving length.
+    """
+    cand: Set[int] = {0}
+    for h in H:
+        cand.add(h)
+        for nb in sp.neighbors(h):
+            cand.add(nb)
+    return sorted(cand)
+
+
+def _expand_key_nodes_to_full_tour(key_nodes: Sequence[int], sp: ShortestPathCache) -> Optional[Tuple[int, ...]]:
+    """
+    Expand a key-node tour into the explicit node-by-node tour by concatenating
+    shortest paths between consecutive key nodes.
+    """
+    if len(key_nodes) < 2:
+        return None
+    full: List[int] = []
+    for a, b in zip(key_nodes[:-1], key_nodes[1:]):
+        p = sp.path(int(a), int(b))
+        if p is None:
+            return None
+        # Append all but last to avoid duplication
+        full.extend(p[:-1])
+    full.append(int(key_nodes[-1]))
+    return tuple(full)
+
+
+def _walking_cost_allowed(visited: Set[int], H: Sequence[int], sp: ShortestPathCache) -> Tuple[float, int]:
+    """
+    Walking cost under the true PTP constraint:
+    friend h can be picked up only at {h} ∪ N(h), and the pickup node must be visited by the car.
+    Returns (walking_cost, infeasibility_count).
+    """
+    total = 0.0
+    infeasible = 0
+    for h in H:
+        allowed = [h] + sp.neighbors(h)
+        candidates = [p for p in allowed if p in visited]
+        if not candidates:
+            infeasible += 1
+            continue
+        total += min(sp.dist(h, p) for p in candidates)
+    return total, infeasible
+
+
+def _walking_cost_relaxed(key_nodes: Sequence[int], H: Sequence[int], sp: ShortestPathCache) -> float:
+    """
+    Relaxed walking cost used only to guide search while infeasible:
+    allow walking to any visited *key* node (not full tour) to keep evaluation cheap.
+    """
+    if not key_nodes:
+        return float("inf")
+    total = 0.0
+    for h in H:
+        total += min(sp.dist(h, p) for p in key_nodes)
+    return total
+
+
+def _driving_len(key_nodes: Sequence[int], sp: ShortestPathCache) -> float:
+    d = 0.0
+    for a, b in zip(key_nodes[:-1], key_nodes[1:]):
+        w = sp.dist(a, b)
+        if math.isinf(w):
+            return float("inf")
+        d += w
+    return d
+
+
+def _build_pickup_dict_from_visited(visited: Set[int], H: Sequence[int], sp: ShortestPathCache) -> Dict[int, List[int]]:
+    """
+    Build a pickup dictionary that satisfies the PTP pickup constraint.
+    """
+    d: Dict[int, List[int]] = {}
+    for h in H:
+        allowed = [h] + sp.neighbors(h)
+        candidates = [p for p in allowed if p in visited]
+        if not candidates:
+            # Leave unassigned; caller should ensure feasibility before using this.
+            continue
+        best = min(candidates, key=lambda p: sp.dist(h, p))
+        d.setdefault(best, []).append(h)
+    return d
+
+
+def _fallback_feasible(G: nx.DiGraph, H: Sequence[int], sp: ShortestPathCache) -> Tuple[List[int], Dict[int, List[int]]]:
+    """
+    Always-feasible baseline: visit every home node once (unique), return to 0.
+    """
+    key_nodes = [0] + sorted(set(int(h) for h in H if int(h) != 0)) + [0]
+    full = _expand_key_nodes_to_full_tour(key_nodes, sp)
+    if full is None:
+        # As a last resort, return a trivial 0->0 tour (may be invalid if H nonempty)
+        return [0, 0], {}
+    visited = set(full)
+    pickup = _build_pickup_dict_from_visited(visited, H, sp)
+    return list(full), pickup
+
+
+# -----------------------------
+# Greedy + Local Search Solver
+# -----------------------------
+
+def ptp_solver_greedy(G: nx.DiGraph, H: list, alpha: float, sp: Optional[ShortestPathCache] = None):
+    """
+    Greedy / local-search PTP solver.
 
     Returns:
-        tuple: A tuple containing:
-            - tour (list): A list of nodes traversed by your car.
-            - pick_up_locs_dict (dict): A dictionary where:
-                - Keys are pick-up locations.
-                - Values are lists or tuples containing friends who get picked up
-                  at that specific pick-up location. Friends are represented by
-                  their home nodes.
-
-    Notes:
-    - All nodes are represented as integers.
-    - The tour must begin and end at node 0.
-    - The tour can only go through existing edges in the graph.
-    - Pick-up locations must be part of the tour.
-    - Each friend should be picked up exactly once.
-    - The pick-up locations must be neighbors of the friends' home nodes or their homes.
+        (tour, pick_up_locs_dict)
     """
+    if sp is None:
+        sp = ShortestPathCache(G)
 
-    key_nodes = [0, 0]  # Key nodes in the tour (will be expanded to full path later)
-    pick_up_locs_dict = {}
-    node_num = G.number_of_nodes()
-    dist_matrix: np.ndarray = nx.floyd_warshall_numpy(
-        G
-    )  # dist_matrix[i][j] is the shortest path distance between node i and node j
-    all_shortest_paths = dict(
-        nx.all_pairs_dijkstra_path(G)
-    )  # Precompute all shortest paths
+    n = sp.n
+    cand_nodes = _candidate_nodes(G, H, sp)
 
-    def cost(key_nodes: list):
-        """Calculate cost based on key nodes (using shortest paths between them)"""
-        walking_cost = 0
-        for friend in H:
-            walking_cost += min(
-                dist_matrix[friend][key_nodes[i]] for i in range(len(key_nodes))
-            )
-        return (
-            alpha
-            * sum(
-                [
-                    dist_matrix[key_nodes[i]][key_nodes[i + 1]]
-                    for i in range(len(key_nodes) - 1)
-                ]
-            )
-            + walking_cost
-        )
+    # Start from a guaranteed-feasible key-node list: visit all homes (unique).
+    key_nodes: List[int] = [0] + sorted(set(int(h) for h in H if int(h) != 0)) + [0]
+    if len(key_nodes) < 2:
+        key_nodes = [0, 0]
 
-    def infeasiblility(key_nodes: list):
-        """Check how many friends cannot be picked up"""
-        visited = 0
-        for friend in H:
-            can_be_visited = False
-            for neighbor in G.neighbors(friend):
-                if neighbor in key_nodes:
-                    can_be_visited = True
-                    break
-            if friend in key_nodes:
-                can_be_visited = True
-            if can_be_visited:
-                visited += 1
-        return len(H) - visited
+    @lru_cache(maxsize=50_000)
+    def _metrics(kn: Tuple[int, ...]) -> _EvalMetrics:
+        kn_list = list(kn)
+        full = _expand_key_nodes_to_full_tour(kn_list, sp)
+        if full is None:
+            return _EvalMetrics(full_tour=tuple([0, 0]), visited=frozenset({0}), driving_len=float("inf"),
+                                walking_allowed=float("inf"), infeasibility=len(H), walking_relaxed=float("inf"))
 
-    def least_cost_insert(key_nodes, i) -> list:
-        """
-        Insert node i into the key_nodes to form a candidate tour.
-        """
-        min_cost = float("inf")
-        min_tour = key_nodes.copy()
-        for j in range(len(key_nodes) - 1):
-            candidate_tour = key_nodes.copy()
-            candidate_tour.insert(j + 1, i)
-            c = cost(candidate_tour)
-            if c < min_cost:
-                min_cost = c
-                min_tour = candidate_tour
-        return min_tour
+        visited = set(full)
+        drive = _driving_len(kn_list, sp)
+        walk_allowed, infeas = _walking_cost_allowed(visited, H, sp)
+        walk_relaxed = _walking_cost_relaxed(kn_list, H, sp)
+        return _EvalMetrics(full_tour=full, visited=frozenset(visited), driving_len=drive,
+                            walking_allowed=walk_allowed, infeasibility=infeas, walking_relaxed=walk_relaxed)
 
-    def remove_node(key_nodes, i) -> list:
-        """
-        Remove node i from the key_nodes to form a candidate tour.
-        """
-        new_tour = key_nodes.copy()
-        if i in new_tour:
-            new_tour.remove(i)
-        return new_tour
+    def true_total(kn: Sequence[int]) -> float:
+        m = _metrics(tuple(kn))
+        if m.infeasibility != 0:
+            return float("inf")
+        return alpha * m.driving_len + m.walking_allowed
 
-    def expand_tour(key_nodes: list) -> list:
-        """
-        Expand key nodes to a full tour with all intermediate nodes.
-        Uses shortest paths between consecutive key nodes.
-        """
-        full_tour = []
-        for i in range(len(key_nodes) - 1):
-            path = all_shortest_paths[key_nodes[i]][key_nodes[i + 1]]
-            # Add all nodes except the last one (to avoid duplicates)
-            full_tour.extend(path[:-1])
-        # Add the final node
-        full_tour.append(key_nodes[-1])
-        return full_tour
+    def infeasibility(kn: Sequence[int]) -> int:
+        return _metrics(tuple(kn)).infeasibility
 
-    def get_pick_up_locs_dict(key_nodes) -> dict:
-        """
-        Get the pick-up locations dictionary from the key nodes.
-        Find the shortest pick-up location for each friend.
-        """
-        pick_up_locs_dict = {}
-        for friend in H:
-            # Check if friend's home is in key_nodes
-            if friend in key_nodes:
-                if friend not in pick_up_locs_dict:
-                    pick_up_locs_dict[friend] = []
-                pick_up_locs_dict[friend].append(friend)
+    def penalized_total(kn: Sequence[int]) -> float:
+        m = _metrics(tuple(kn))
+        return alpha * m.driving_len + m.walking_relaxed
+
+    def best_insertion(kn: List[int], node: int) -> List[int]:
+        if node in kn:
+            return kn
+        best = None
+        best_val = float("inf")
+        for pos in range(1, len(kn)):  # insert before pos
+            cand = kn[:pos] + [node] + kn[pos:]
+            val = penalized_total(cand)
+            if val < best_val:
+                best_val = val
+                best = cand
+        return best if best is not None else kn
+
+    def remove_node(kn: List[int], node: int) -> List[int]:
+        if node == 0:
+            return kn
+        if node not in kn:
+            return kn
+        # remove a single occurrence (key_nodes rarely have duplicates except 0)
+        out = kn.copy()
+        out.remove(node)
+        if out[0] != 0:
+            out.insert(0, 0)
+        if out[-1] != 0:
+            out.append(0)
+        if len(out) < 2:
+            out = [0, 0]
+        return out
+
+    # Local search: best improvement over insert/remove moves within candidate set
+    max_rounds = 200
+    for _ in range(max_rounds):
+        cur_inf = infeasibility(key_nodes)
+        cur_true = true_total(key_nodes)
+
+        best_kn = key_nodes
+        best_inf = cur_inf
+        best_val = cur_true if cur_inf == 0 else penalized_total(key_nodes)
+
+        for v in cand_nodes:
+            if v == 0:
+                continue
+            if v in key_nodes:
+                cand = remove_node(key_nodes, v)
             else:
-                # Find the neighbor in key_nodes with shortest distance
-                min_dist = float("inf")
-                best_pickup = None
-                for neighbor in G.neighbors(friend):
-                    if neighbor in key_nodes:
-                        if dist_matrix[friend][neighbor] < min_dist:
-                            min_dist = dist_matrix[friend][neighbor]
-                            best_pickup = neighbor
+                cand = best_insertion(key_nodes, v)
 
-                if best_pickup is not None:
-                    if best_pickup not in pick_up_locs_dict:
-                        pick_up_locs_dict[best_pickup] = []
-                    pick_up_locs_dict[best_pickup].append(friend)
-        return pick_up_locs_dict
+            c_inf = infeasibility(cand)
+            if c_inf < best_inf:
+                best_inf = c_inf
+                best_kn = cand
+                best_val = true_total(cand) if c_inf == 0 else penalized_total(cand)
+            elif c_inf == best_inf:
+                c_val = true_total(cand) if c_inf == 0 else penalized_total(cand)
+                if c_val < best_val - 1e-9:
+                    best_kn = cand
+                    best_val = c_val
 
-    while True:
-        candidate_tours = []
-        for i in range(node_num):
-            if i == 0:
-                continue  # 0 is the start and end node, so it cannot be removed or inserted
-            candidate_tour = (
-                remove_node(key_nodes, i)
-                if i in key_nodes
-                else least_cost_insert(key_nodes, i)
-            )
-            candidate_tours.append(candidate_tour)
-
-        current_infeasibility = infeasiblility(key_nodes)
-
-        if current_infeasibility == 0:
-            feasible_tours = [
-                candidate_tour
-                for candidate_tour in candidate_tours
-                if infeasiblility(candidate_tour) == 0
-            ]
-            if not feasible_tours:
-                break
-            new_tour = min(feasible_tours, key=cost)
-        else:
-            better_tours = [
-                candidate_tour
-                for candidate_tour in candidate_tours
-                if infeasiblility(candidate_tour) < current_infeasibility
-            ]
-            if not better_tours:
-                break
-            new_tour = min(better_tours, key=cost)
-
-        if cost(key_nodes) <= cost(new_tour) and current_infeasibility == 0:
-            # No cost improvement for feasible tour
+        # Stopping: feasible and no improvement
+        if cur_inf == 0 and best_inf == 0 and best_val >= cur_true - 1e-9:
             break
-        else:
-            key_nodes = new_tour
 
-    # Expand key nodes to full tour with all intermediate nodes
-    tour = expand_tour(key_nodes)
+        # Otherwise take the best move found
+        if best_kn == key_nodes:
+            # No change possible -> stop
+            break
+        key_nodes = best_kn
 
-    # Generate final pick-up locations dictionary
-    pick_up_locs_dict = get_pick_up_locs_dict(key_nodes)
+    m = _metrics(tuple(key_nodes))
+    tour = list(m.full_tour)
+    pickup = _build_pickup_dict_from_visited(set(m.visited), H, sp)
 
-    # print(f"[GREEDY] friends: {H}")
-    # print(f"[GREEDY] key_nodes: {key_nodes}")
-    # print(f"[GREEDY] tour: {tour}")
-    # print(f"[GREEDY] pick_up_locs_dict: {pick_up_locs_dict}")
-    # print(f"[GREEDY] cost: {cost(tour)}")
+    if m.infeasibility != 0:
+        return _fallback_feasible(G, H, sp)
 
-    return tour, pick_up_locs_dict
+    return tour, pickup
 
 
-def ptp_solver_multi_start(G: nx.DiGraph, H: list, alpha: float, num_starts: int = 10):
+# -----------------------------
+# Multi-start wrapper
+# -----------------------------
+
+def ptp_solver_multi_start(G: nx.DiGraph, H: list, alpha: float, num_starts: int = 10, sp: Optional[ShortestPathCache] = None):
     """
-    PTP solver using multi-start strategy.
-
-    Parameters:
-        G (nx.DiGraph): A NetworkX graph representing the city.
-        H (list): A list of home nodes.
-        alpha (float): The coefficient for calculating driving cost.
-        num_starts (int): The number of starting points.
-
-    Returns:
-        tuple: A tuple containing:
-            - tour (list): A list of nodes traversed by your car.
-            - pick_up_locs_dict (dict): A dictionary where:
-                - Keys are pick-up locations.
-                - Values are lists or tuples containing friends who get picked up
-                  at that specific pick-up location. Friends are represented by
-                  their home nodes.
+    Multi-start strategy: generate multiple initial key-node tours and run greedy local search.
     """
+    if sp is None:
+        sp = ShortestPathCache(G)
 
-    n = G.number_of_nodes()
-    dist_matrix = nx.floyd_warshall_numpy(G)
-    all_shortest_paths = dict(nx.all_pairs_dijkstra_path(G))
+    cand_nodes = _candidate_nodes(G, H, sp)
+    n = sp.n
 
-    def cost(key_nodes: list):
-        walking_cost = 0
-        for friend in H:
-            walking_cost += min(dist_matrix[friend][key_nodes[i]] for i in range(len(key_nodes)))
-        driving_cost = sum(
-            [
-                dist_matrix[key_nodes[i]][key_nodes[i + 1]]
-                for i in range(len(key_nodes) - 1)
-            ]
-        )
-        return alpha * driving_cost + walking_cost
+    def random_initial() -> List[int]:
+        # Start from a subset of candidate pickup nodes; always keep 0 at ends.
+        base = [v for v in cand_nodes if v != 0]
+        if not base:
+            return [0, 0]
+        k = random.randint(max(1, len(H) // 2), min(len(base), len(H) + 3))
+        chosen = random.sample(base, k)
+        return [0] + chosen + [0]
 
-    def is_feasible(key_nodes: list):
-        for friend in H:
-            can_pickup = False
-            if friend in key_nodes:
-                can_pickup = True
-            else:
-                for neighbor in G.neighbors(friend):
-                    if neighbor in key_nodes:
-                        can_pickup = True
-                        break
-            if not can_pickup:
-                return False
-        return True
+    initial_solutions: List[List[int]] = []
+    # Deterministic baseline
+    initial_solutions.append([0] + sorted(set(int(h) for h in H if int(h) != 0)) + [0])
+    # Add random starts
+    while len(initial_solutions) < max(1, num_starts):
+        initial_solutions.append(random_initial())
 
-    def expand_tour(key_nodes: list):
-        full_tour = []
-        for i in range(len(key_nodes) - 1):
-            path = all_shortest_paths[key_nodes[i]][key_nodes[i + 1]]
-            full_tour.extend(path[:-1])
-        full_tour.append(key_nodes[-1])
-        return full_tour
+    best_tour = None
+    best_pickup = None
+    best_cost = float("inf")
 
-    def get_pick_up_locs_dict(key_nodes):
-        """获取接送位置字典"""
-        pick_up_locs_dict = {}
-        for friend in H:
-            if friend in key_nodes:
-                if friend not in pick_up_locs_dict:
-                    pick_up_locs_dict[friend] = []
-                pick_up_locs_dict[friend].append(friend)
-            else:
-                min_dist = float("inf")
-                best_pickup = None
-                for neighbor in G.neighbors(friend):
-                    if neighbor in key_nodes:
-                        if dist_matrix[friend][neighbor] < min_dist:
-                            min_dist = dist_matrix[friend][neighbor]
-                            best_pickup = neighbor
-                if best_pickup is not None:
-                    if best_pickup not in pick_up_locs_dict:
-                        pick_up_locs_dict[best_pickup] = []
-                    pick_up_locs_dict[best_pickup].append(friend)
-        return pick_up_locs_dict
+    for init in initial_solutions:
+        tour, pickup = ptp_solver_greedy(G, H, alpha, sp=sp) if init == initial_solutions[0] else _run_greedy_from_init(G, H, alpha, init, sp)
+        legit, drive, walk = analyze_solution(G, H, alpha, tour, pickup)
+        if legit:
+            total = drive + walk
+            if total < best_cost:
+                best_cost = total
+                best_tour = tour
+                best_pickup = pickup
 
-    def infeasibility(kn):
-        visited = 0
-        for friend in H:
-            can_be_visited = False
-            if friend in kn:
-                can_be_visited = True
-            else:
-                for neighbor in G.neighbors(friend):
-                    if neighbor in kn:
-                        can_be_visited = True
-                        break
-            if can_be_visited:
-                visited += 1
-        return len(H) - visited
-
-    def least_cost_insert(kn, i):
-        min_cost = float("inf")
-        min_tour = kn.copy()
-        for j in range(len(kn) - 1):
-            candidate = kn.copy()
-            candidate.insert(j + 1, i)
-            c = cost(candidate)
-            if c < min_cost:
-                min_cost = c
-                min_tour = candidate
-        return min_tour
-
-    def remove_node(kn, i):
-        new_tour = kn.copy()
-        if i in new_tour:
-            new_tour.remove(i)
-        return new_tour
-
-    def local_search(initial_key_nodes):
-        key_nodes = initial_key_nodes.copy()
-
-        while True:
-            candidate_tours = []
-            for i in range(n):
-                if i == 0:
-                    continue
-                candidate = (
-                    remove_node(key_nodes, i)
-                    if i in key_nodes
-                    else least_cost_insert(key_nodes, i)
-                )
-                candidate_tours.append(candidate)
-
-            current_infeasibility = infeasibility(key_nodes)
-
-            if current_infeasibility == 0:
-                feasible_tours = [
-                    ct for ct in candidate_tours if infeasibility(ct) == 0
-                ]
-                if not feasible_tours:
-                    break
-                new_tour = min(feasible_tours, key=cost)
-            else:
-                better_tours = [
-                    ct
-                    for ct in candidate_tours
-                    if infeasibility(ct) < current_infeasibility
-                ]
-                if not better_tours:
-                    break
-                new_tour = min(better_tours, key=cost)
-
-            if cost(key_nodes) <= cost(new_tour) and current_infeasibility == 0:
-                break
-            else:
-                key_nodes = new_tour
-
-        return key_nodes
-
-    def generate_initial_solutions(num_starts):
-        initial_solutions = []
-
-        initial_solutions.append([0, 0])
-
-        # random sample friends
-        for _ in range(min(3, num_starts // 3)):
-            solution = [0]
-            friends_sample = random.sample(
-                H, min(len(H), random.randint(1, min(5, len(H))))
-            )
-            solution.extend(friends_sample)
-            solution.append(0)
-            initial_solutions.append(solution)
-
-        # nearest neighbor
-        if len(initial_solutions) < num_starts:
-            solution = [0]
-            current = 0
-            remaining = set(H)
-            while remaining:
-                nearest = min(remaining, key=lambda h: dist_matrix[current][h])
-                solution.append(nearest)
-                remaining.remove(nearest)
-                current = nearest
-            solution.append(0)
-            initial_solutions.append(solution)
-
-        # farthest insertion
-        if len(initial_solutions) < num_starts:
-            solution = [0, 0]
-            remaining = set(H)
-            while remaining:
-                # 找到距离tour最远的点
-                farthest = max(
-                    remaining,
-                    key=lambda h: min(
-                        dist_matrix[h][solution[i]] for i in range(len(solution))
-                    ),
-                )
-                # 找到最佳插入位置
-                best_pos = 1
-                best_cost_increase = float("inf")
-                for pos in range(1, len(solution)):
-                    cost_increase = (
-                        dist_matrix[solution[pos - 1]][farthest]
-                        + dist_matrix[farthest][solution[pos]]
-                        - dist_matrix[solution[pos - 1]][solution[pos]]
-                    )
-                    if cost_increase < best_cost_increase:
-                        best_cost_increase = cost_increase
-                        best_pos = pos
-                solution.insert(best_pos, farthest)
-                remaining.remove(farthest)
-            initial_solutions.append(solution)
-
-        # random generate remaining initial solutions
-        while len(initial_solutions) < num_starts:
-            solution = [0]
-            # 随机选择一些节点
-            num_nodes = random.randint(max(1, len(H) // 2), min(n - 1, len(H) + 3))
-            candidates = list(range(1, n))
-            selected = random.sample(candidates, min(num_nodes, len(candidates)))
-            solution.extend(selected)
-            solution.append(0)
-            initial_solutions.append(solution)
-
-        return initial_solutions
-
-    # 主循环：多起始点搜索
-    #print(f"[MULTI-START] Running with {num_starts} different starting points...")
-
-    initial_solutions = generate_initial_solutions(num_starts)
-    best_key_nodes = None
-    best_cost_value = float("inf")
-
-    for i, initial_solution in enumerate(initial_solutions):
-        # 从每个初始解开始局部搜索
-        result_key_nodes = local_search(initial_solution)
-
-        # 检查是否可行
-        if is_feasible(result_key_nodes):
-            result_cost = cost(result_key_nodes)
-
-            if result_cost < best_cost_value:
-                best_cost_value = result_cost
-                best_key_nodes = result_key_nodes
-                #print(f"[MULTI-START] New best at start {i + 1}/{num_starts}: cost={result_cost:.2f}")
-
-    #print(f"[MULTI-START] Final best cost: {best_cost_value:.2f}")
-
-    tour = expand_tour(best_key_nodes)
-    pick_up_locs_dict = get_pick_up_locs_dict(best_key_nodes)
-
-    return tour, pick_up_locs_dict
+    if best_tour is None:
+        return _fallback_feasible(G, H, sp)
+    return best_tour, best_pickup
 
 
-def ptp_solver_ILP(G: nx.DiGraph, H: list, alpha: float):
+def _run_greedy_from_init(G: nx.DiGraph, H: list, alpha: float, init_key_nodes: List[int], sp: ShortestPathCache):
     """
-    PTP solver using Integer Linear Programming (ILP).
-    Based on Miller-Tucker-Zemlin (MTZ) formulation
-
-    Parameters:
-        G (nx.DiGraph): A NetworkX graph representing the city.
-        H (list): A list of home nodes.
-        alpha (float): The coefficient for calculating driving cost.
-
-    Returns:
-        tuple: (tour, pick_up_locs_dict)
+    Run the greedy local-search routine starting from a provided initial key-node tour.
     """
+    # Slightly hacky reuse: temporarily seed the greedy by replacing its start state.
+    # We implement a minimal local-search here mirroring ptp_solver_greedy but with a given init.
+    cand_nodes = _candidate_nodes(G, H, sp)
+    key_nodes = init_key_nodes.copy()
+    if not key_nodes or key_nodes[0] != 0:
+        key_nodes = [0] + [v for v in key_nodes if v != 0] + [0]
+    if key_nodes[-1] != 0:
+        key_nodes.append(0)
+    if len(key_nodes) < 2:
+        key_nodes = [0, 0]
 
-    n = G.number_of_nodes()
+    @lru_cache(maxsize=30_000)
+    def _metrics(kn: Tuple[int, ...]) -> _EvalMetrics:
+        kn_list = list(kn)
+        full = _expand_key_nodes_to_full_tour(kn_list, sp)
+        if full is None:
+            return _EvalMetrics(full_tour=tuple([0, 0]), visited=frozenset({0}), driving_len=float("inf"),
+                                walking_allowed=float("inf"), infeasibility=len(H), walking_relaxed=float("inf"))
+
+        visited = set(full)
+        drive = _driving_len(kn_list, sp)
+        walk_allowed, infeas = _walking_cost_allowed(visited, H, sp)
+        walk_relaxed = _walking_cost_relaxed(kn_list, H, sp)
+        return _EvalMetrics(full_tour=full, visited=frozenset(visited), driving_len=drive,
+                            walking_allowed=walk_allowed, infeasibility=infeas, walking_relaxed=walk_relaxed)
+
+    def true_total(kn: Sequence[int]) -> float:
+        m = _metrics(tuple(kn))
+        if m.infeasibility != 0:
+            return float("inf")
+        return alpha * m.driving_len + m.walking_allowed
+
+    def infeasibility(kn: Sequence[int]) -> int:
+        return _metrics(tuple(kn)).infeasibility
+
+    def penalized_total(kn: Sequence[int]) -> float:
+        m = _metrics(tuple(kn))
+        return alpha * m.driving_len + m.walking_relaxed
+
+    def best_insertion(kn: List[int], node: int) -> List[int]:
+        if node in kn:
+            return kn
+        best = None
+        best_val = float("inf")
+        for pos in range(1, len(kn)):
+            cand = kn[:pos] + [node] + kn[pos:]
+            val = penalized_total(cand)
+            if val < best_val:
+                best_val = val
+                best = cand
+        return best if best is not None else kn
+
+    def remove_node(kn: List[int], node: int) -> List[int]:
+        if node == 0 or node not in kn:
+            return kn
+        out = kn.copy()
+        out.remove(node)
+        if out[0] != 0:
+            out.insert(0, 0)
+        if out[-1] != 0:
+            out.append(0)
+        if len(out) < 2:
+            out = [0, 0]
+        return out
+
+    max_rounds = 150
+    for _ in range(max_rounds):
+        cur_inf = infeasibility(key_nodes)
+        cur_true = true_total(key_nodes)
+
+        best_kn = key_nodes
+        best_inf = cur_inf
+        best_val = cur_true if cur_inf == 0 else penalized_total(key_nodes)
+
+        for v in cand_nodes:
+            if v == 0:
+                continue
+            cand = remove_node(key_nodes, v) if v in key_nodes else best_insertion(key_nodes, v)
+            c_inf = infeasibility(cand)
+            if c_inf < best_inf:
+                best_inf = c_inf
+                best_kn = cand
+                best_val = true_total(cand) if c_inf == 0 else penalized_total(cand)
+            elif c_inf == best_inf:
+                c_val = true_total(cand) if c_inf == 0 else penalized_total(cand)
+                if c_val < best_val - 1e-9:
+                    best_kn = cand
+                    best_val = c_val
+
+        if cur_inf == 0 and best_inf == 0 and best_val >= cur_true - 1e-9:
+            break
+        if best_kn == key_nodes:
+            break
+        key_nodes = best_kn
+
+    m = _metrics(tuple(key_nodes))
+    if m.infeasibility != 0:
+        return _fallback_feasible(G, H, sp)
+    tour = list(m.full_tour)
+    pickup = _build_pickup_dict_from_visited(set(m.visited), H, sp)
+    return tour, pickup
+
+
+# -----------------------------
+# ILP solver (small graphs)
+# -----------------------------
+
+def ptp_solver_ILP(G: nx.DiGraph, H: list, alpha: float, time_limit: int = 30, sp: Optional[ShortestPathCache] = None):
+    """
+    Exact ILP using MTZ formulation (intended for small graphs).
+    Falls back to heuristic if not solved to optimality.
+    """
+    if sp is None:
+        sp = ShortestPathCache(G)
+
+    n = sp.n
     nodes = list(range(n))
-
-    dist_matrix = nx.floyd_warshall_numpy(G)
-    all_shortest_paths = dict(nx.all_pairs_dijkstra_path(G))
 
     prob = pl.LpProblem("PTP_Problem", pl.LpMinimize)
 
-    # 决策变量
-    # x[i][j] = 1 表示从节点i到节点j
-    x = {}
-    for i in nodes:
-        for j in nodes:
-            if i != j:
-                x[i, j] = pl.LpVariable(f"x_{i}_{j}", cat="Binary")
+    # Decision variables
+    x = {(i, j): pl.LpVariable(f"x_{i}_{j}", cat="Binary") for i in nodes for j in nodes if i != j}
 
-    # u[i]: MTZ约束的辅助变量，表示节点i在tour中的访问顺序
-    u = {}
-    for i in nodes:
-        if i != 0:  # 节点0是起点，不需要u变量
-            u[i] = pl.LpVariable(f"u_{i}", lowBound=1, upBound=n - 1, cat="Integer")
+    # Node visitation indicator: z[i] = 1 iff node i is visited in the tour (i != 0)
+    z = {i: pl.LpVariable(f"z_{i}", cat="Binary") for i in nodes if i != 0}
 
-    # y[h][p] = 1 表示朋友h在位置p被接送
-    # p可以是h的家或者h的邻居
+    # MTZ ordering variables
+    u = {i: pl.LpVariable(f"u_{i}", lowBound=1, upBound=n - 1, cat="Integer") for i in nodes if i != 0}
+
+    # Pickup assignment y[h,p] for allowed pickup nodes p in {h} ∪ N(h)
     y = {}
     for h in H:
-        # 朋友可以在自己家被接送
-        pickup_locations = [h]
-        # 或者在邻居节点被接送
-        for neighbor in G.neighbors(h):
-            pickup_locations.append(neighbor)
+        for p in [h] + sp.neighbors(h):
+            y[(h, p)] = pl.LpVariable(f"y_{h}_{p}", cat="Binary")
 
-        for p in pickup_locations:
-            y[h, p] = pl.LpVariable(f"y_{h}_{p}", cat="Binary")
+    # Objective components
+    driving_cost = alpha * pl.lpSum([sp.dist(i, j) * x[(i, j)] for (i, j) in x.keys()])
+    walking_cost = pl.lpSum([sp.dist(h, p) * y[(h, p)] for (h, p) in y.keys()])
+    prob += driving_cost + walking_cost
 
-    # 目标函数：最小化 alpha * 驾驶成本 + 步行成本
-    driving_cost = pl.lpSum(
-        [alpha * dist_matrix[i][j] * x[i, j] for i in nodes for j in nodes if i != j]
-    )
+    # Degree constraints for node 0
+    prob += pl.lpSum([x[(0, j)] for j in nodes if j != 0]) == 1
+    prob += pl.lpSum([x[(i, 0)] for i in nodes if i != 0]) == 1
 
-    walking_cost = pl.lpSum(
-        [dist_matrix[h][p] * y[h, p] for h in H for p in ([h] + list(G.neighbors(h)))]
-    )
-
-    prob += driving_cost + walking_cost, "Total_Cost"
-
-    # 约束条件
-
-    # 1. 流守恒约束：从节点0出发必须回到节点0
-    prob += pl.lpSum([x[0, j] for j in nodes if j != 0]) == 1, "Start_from_0"
-    prob += pl.lpSum([x[i, 0] for i in nodes if i != 0]) == 1, "Return_to_0"
-
-    # 2. 对于每个非0节点，如果它在tour中，入度=出度≤1
+    # Flow constraints + define z
     for j in nodes:
-        if j != 0:
-            prob += (
-                (
-                    pl.lpSum([x[i, j] for i in nodes if i != j])
-                    == pl.lpSum([x[j, k] for k in nodes if k != j])
-                ),
-                f"Flow_conservation_{j}",
-            )
-            prob += (
-                pl.lpSum([x[i, j] for i in nodes if i != j]) <= 1,
-                f"Max_in_degree_{j}",
-            )
+        if j == 0:
+            continue
+        prob += pl.lpSum([x[(i, j)] for i in nodes if i != j]) == z[j]
+        prob += pl.lpSum([x[(j, k)] for k in nodes if k != j]) == z[j]
 
-    # 3. MTZ约束：消除子环
-    # u_i - u_j + n*x[i,j] <= n-1 for all i,j != 0, i != j
+    # MTZ subtour elimination: only active when both nodes are visited
     for i in nodes:
         if i == 0:
             continue
         for j in nodes:
             if j == 0 or i == j:
                 continue
-            prob += u[i] - u[j] + n * x[i, j] <= n - 1, f"MTZ_{i}_{j}"
+            prob += u[i] - u[j] + (n - 1) * x[(i, j)] <= (n - 2) + (n - 1) * (2 - z[i] - z[j])
 
-    # 4. 每个朋友必须被接送恰好一次
+    # Pickup assignment: each friend assigned exactly once among allowed nodes
     for h in H:
-        pickup_locations = [h] + list(G.neighbors(h))
-        prob += pl.lpSum([y[h, p] for p in pickup_locations]) == 1, f"Pickup_friend_{h}"
+        prob += pl.lpSum([y[(h, p)] for p in [h] + sp.neighbors(h)]) == 1
 
-    # 5. 接送位置必须在tour中（如果朋友在p被接送，则tour必须经过p）
-    for h in H:
-        pickup_locations = [h] + list(G.neighbors(h))
-        for p in pickup_locations:
-            # 如果y[h,p]=1，则节点p必须在tour中
-            # 节点p在tour中意味着：sum(x[i,p] for i!=p) >= y[h,p]
-            if p == 0:
-                # 节点0总是在tour中
-                continue
-            else:
-                prob += (
-                    pl.lpSum([x[i, p] for i in nodes if i != p]) >= y[h, p],
-                    f"Pickup_location_in_tour_{h}_{p}",
-                )
+    # If a pickup node p is chosen, it must be visited in the tour (or be 0? p is never 0 typically)
+    for (h, p), var in y.items():
+        if p == 0:
+            continue
+        prob += var <= z[p]
 
-    # 求解
-    solver = pl.PULP_CBC_CMD(msg=0)  # 使用CBC求解器，不显示详细信息
-    prob.solve(solver)
+    # Solve
+    solver = pl.PULP_CBC_CMD(msg=False, timeLimit=time_limit)
+    status = prob.solve(solver)
 
-    # 检查求解状态
-    if prob.status != pl.LpStatusOptimal:
-        print(f"[WARNING] ILP solver status: {pl.LpStatus[prob.status]}")
-        # 如果ILP求解失败，返回简单的贪心解
-        return ptp_solver(G, H, alpha)
+    if pl.LpStatus[status] != "Optimal":
+        # Robust fallback (avoid recursion)
+        return ptp_solver_multi_start(G, H, alpha, num_starts=10, sp=sp)
 
-    # 提取解
-    # 构建tour
-    tour_edges = []
-    for i in nodes:
-        for j in nodes:
-            if i != j and pl.value(x[i, j]) > 0.5:  # 二元变量应该是0或1
-                tour_edges.append((i, j))
+    # Reconstruct tour edges
+    succ = {}
+    for (i, j), var in x.items():
+        if var.value() is not None and var.value() > 0.5:
+            succ[i] = j
 
-    # 从节点0开始构建tour路径
-    tour = [0]
-    current = 0
-    visited = {0}
+    if 0 not in succ:
+        return ptp_solver_multi_start(G, H, alpha, num_starts=10, sp=sp)
 
-    while len(visited) < len(tour_edges) + 1:
-        # 找到从current出发的下一个节点
-        next_node = None
-        for i, j in tour_edges:
-            if i == current:
-                next_node = j
-                break
-
-        if next_node is None:
+    key_nodes = [0]
+    cur = 0
+    seen = set([0])
+    while True:
+        cur = succ.get(cur, None)
+        if cur is None:
             break
-
-        tour.append(next_node)
-        visited.add(next_node)
-        current = next_node
-
-        if current == 0:  # 回到起点
+        key_nodes.append(cur)
+        if cur == 0:
             break
+        if cur in seen:
+            break
+        seen.add(cur)
 
-    # 扩展tour：在关键节点之间插入最短路径
-    full_tour = []
-    for i in range(len(tour) - 1):
-        path = all_shortest_paths[tour[i]][tour[i + 1]]
-        full_tour.extend(path[:-1])
-    full_tour.append(tour[-1])
+    if key_nodes[-1] != 0:
+        key_nodes.append(0)
 
-    # 构建pick_up_locs_dict
-    pick_up_locs_dict = {}
+    full = _expand_key_nodes_to_full_tour(key_nodes, sp)
+    if full is None:
+        return ptp_solver_multi_start(G, H, alpha, num_starts=10, sp=sp)
+
+    visited = set(full)
+
+    pickup = {}
     for h in H:
-        pickup_locations = [h] + list(G.neighbors(h))
-        for p in pickup_locations:
-            if pl.value(y[h, p]) > 0.5:  # 朋友h在位置p被接送
-                if p not in pick_up_locs_dict:
-                    pick_up_locs_dict[p] = []
-                pick_up_locs_dict[p].append(h)
+        chosen = None
+        for p in [h] + sp.neighbors(h):
+            var = y.get((h, p))
+            if var is not None and var.value() is not None and var.value() > 0.5:
+                chosen = p
                 break
+        if chosen is None:
+            # should not happen in optimal
+            continue
+        pickup.setdefault(chosen, []).append(h)
 
-    # Debug信息
-    #print(f"[ILP] Optimal cost: {pl.value(prob.objective):.2f}")
-    #print(f"[ILP] Tour: {full_tour}")
-    #print(f"[ILP] Pick-up locations: {pick_up_locs_dict}")
+    # Ensure feasibility w.r.t. actually visited set; if mismatch, rebuild safely
+    walk_allowed, infeas = _walking_cost_allowed(visited, H, sp)
+    if infeas != 0:
+        pickup = _build_pickup_dict_from_visited(visited, H, sp)
 
-    return full_tour, pick_up_locs_dict
+    return list(full), pickup
 
 
-def ptp_solver_SA(G: nx.DiGraph, H: list, alpha: float):
+# -----------------------------
+# Simulated Annealing Solver
+# -----------------------------
+
+def ptp_solver_SA(G: nx.DiGraph, H: list, alpha: float, sp: Optional[ShortestPathCache] = None):
     """
-    PTP solver using Simulated Annealing.
-
-    Parameters:
-        G (nx.DiGraph): A NetworkX graph representing the city.
-        H (list): A list of home nodes.
-        alpha (float): The coefficient for calculating driving cost.
-
-    Returns:
-        tuple: (tour, pick_up_locs_dict)
+    Simulated annealing over key-node tours.
+    Only accepts feasible solutions during the SA walk, ensuring output feasibility.
     """
+    if sp is None:
+        sp = ShortestPathCache(G)
 
-    n = G.number_of_nodes()
-    dist_matrix = nx.floyd_warshall_numpy(G)
-    all_shortest_paths = dict(nx.all_pairs_dijkstra_path(G))
+    cand_nodes = _candidate_nodes(G, H, sp)
+    base_nodes = [v for v in cand_nodes if v != 0]
 
-    def cost(key_nodes: list):
-        walking_cost = 0
-        for friend in H:
-            walking_cost += min(
-                dist_matrix[friend][key_nodes[i]] for i in range(len(key_nodes))
-            )
-        driving_cost = sum(
-            [
-                dist_matrix[key_nodes[i]][key_nodes[i + 1]]
-                for i in range(len(key_nodes) - 1)
-            ]
-        )
-        return alpha * driving_cost + walking_cost
+    # Start from feasible baseline
+    init = [0] + sorted(set(int(h) for h in H if int(h) != 0)) + [0]
+    if len(init) < 2:
+        init = [0, 0]
 
-    def is_feasible(key_nodes: list):
-        for friend in H:
-            can_pickup = False
-            if friend in key_nodes:
-                can_pickup = True
-            else:
-                for neighbor in G.neighbors(friend):
-                    if neighbor in key_nodes:
-                        can_pickup = True
-                        break
-            if not can_pickup:
-                return False
-        return True
+    @lru_cache(maxsize=50_000)
+    def _metrics(kn: Tuple[int, ...]) -> _EvalMetrics:
+        kn_list = list(kn)
+        full = _expand_key_nodes_to_full_tour(kn_list, sp)
+        if full is None:
+            return _EvalMetrics(full_tour=tuple([0, 0]), visited=frozenset({0}), driving_len=float("inf"),
+                                walking_allowed=float("inf"), infeasibility=len(H), walking_relaxed=float("inf"))
+        visited = set(full)
+        drive = _driving_len(kn_list, sp)
+        walk_allowed, infeas = _walking_cost_allowed(visited, H, sp)
+        walk_relaxed = _walking_cost_relaxed(kn_list, H, sp)
+        return _EvalMetrics(full_tour=full, visited=frozenset(visited), driving_len=drive,
+                            walking_allowed=walk_allowed, infeasibility=infeas, walking_relaxed=walk_relaxed)
 
-    def expand_tour(key_nodes: list):
-        full_tour = []
-        for i in range(len(key_nodes) - 1):
-            path = all_shortest_paths[key_nodes[i]][key_nodes[i + 1]]
-            full_tour.extend(path[:-1])
-        full_tour.append(key_nodes[-1])
-        return full_tour
+    def is_feasible(kn: Sequence[int]) -> bool:
+        return _metrics(tuple(kn)).infeasibility == 0
 
-    def get_pick_up_locs_dict(key_nodes):
-        pick_up_locs_dict = {}
-        for friend in H:
-            if friend in key_nodes:
-                if friend not in pick_up_locs_dict:
-                    pick_up_locs_dict[friend] = []
-                pick_up_locs_dict[friend].append(friend)
-            else:
-                min_dist = float("inf")
-                best_pickup = None
-                for neighbor in G.neighbors(friend):
-                    if neighbor in key_nodes:
-                        if dist_matrix[friend][neighbor] < min_dist:
-                            min_dist = dist_matrix[friend][neighbor]
-                            best_pickup = neighbor
-                if best_pickup is not None:
-                    if best_pickup not in pick_up_locs_dict:
-                        pick_up_locs_dict[best_pickup] = []
-                    pick_up_locs_dict[best_pickup].append(friend)
-        return pick_up_locs_dict
+    def total_cost(kn: Sequence[int]) -> float:
+        m = _metrics(tuple(kn))
+        if m.infeasibility != 0:
+            return float("inf")
+        return alpha * m.driving_len + m.walking_allowed
 
-    def get_neighbor(current_solution):
-        """
-        生成邻域解：随机选择一种操作
-        1. 插入一个新节点（40%）
-        2. 删除一个节点（30%）
-        3. 交换两个节点位置（20%）
-        4. 2-opt交换（10%）
-        """
-        new_solution = current_solution.copy()
-        operation = random.random()
+    def get_neighbor(kn: List[int]) -> List[int]:
+        new = kn.copy()
+        if len(new) < 2:
+            return [0, 0]
+        # Ensure endpoints are 0
+        new[0] = 0
+        new[-1] = 0
 
-        if operation < 0.4:  # 插入操作
-            # 随机选择一个不在tour中的节点插入
-            not_in_tour = [i for i in range(n) if i not in new_solution and i != 0]
-            if not_in_tour:
-                node_to_insert = random.choice(not_in_tour)
-                # 随机选择插入位置（不包括首尾的0）
-                insert_pos = random.randint(1, len(new_solution) - 1)
-                new_solution.insert(insert_pos, node_to_insert)
+        op = random.random()
+        if op < 0.35:  # insertion
+            if base_nodes:
+                node = random.choice(base_nodes)
+                if node not in new:
+                    pos = random.randint(1, max(1, len(new) - 1))
+                    new.insert(pos, node)
 
-        elif operation < 0.7:  # 删除操作
-            # 随机删除一个节点（不包括首尾的0）
-            if len(new_solution) > 2:
-                removable = [i for i in range(1, len(new_solution) - 1)]
-                if removable:
-                    pos_to_remove = random.choice(removable)
-                    new_solution.pop(pos_to_remove)
+        elif op < 0.70:  # deletion
+            removable = [i for i in range(1, len(new) - 1)]
+            if removable and len(new) > 2:
+                idx = random.choice(removable)
+                new.pop(idx)
 
-        elif operation < 0.9:  # 交换操作
-            # 随机交换两个节点（不包括首尾的0）
-            if len(new_solution) > 3:
-                indices = random.sample(
-                    range(1, len(new_solution) - 1), min(2, len(new_solution) - 2)
-                )
-                if len(indices) == 2:
-                    new_solution[indices[0]], new_solution[indices[1]] = (
-                        new_solution[indices[1]],
-                        new_solution[indices[0]],
-                    )
+        elif op < 0.90:  # swap
+            if len(new) > 3:
+                i, j = random.sample(range(1, len(new) - 1), 2)
+                new[i], new[j] = new[j], new[i]
 
-        else:  # 2-opt操作
-            # 反转一段路径
-            if len(new_solution) > 3:
-                i, j = sorted(random.sample(range(1, len(new_solution) - 1), 2))
-                new_solution[i : j + 1] = reversed(new_solution[i : j + 1])
+        else:  # 2-opt
+            if len(new) > 4:
+                i, j = sorted(random.sample(range(1, len(new) - 1), 2))
+                new[i:j+1] = reversed(new[i:j+1])
 
-        return new_solution
+        # Clean up duplicates of 0 inside
+        new = [0] + [v for v in new[1:-1] if v != 0] + [0]
+        if len(new) < 2:
+            new = [0, 0]
+        return new
 
-    initial_solution = [0, 0]
-    for h in H:
-        # 尝试插入朋友节点或其邻居
-        best_cost = float("inf")
-        best_node = h
-        for candidate in [h] + list(G.neighbors(h)):
-            test_solution = initial_solution[:-1] + [candidate, 0]
-            if is_feasible(test_solution):
-                c = cost(test_solution)
-                if c < best_cost:
-                    best_cost = c
-                    best_node = candidate
-        if best_node not in initial_solution:
-            initial_solution.insert(-1, best_node)
+    current = init
+    # Ensure starting feasible (it is, by construction)
+    if not is_feasible(current):
+        tour, pickup = _fallback_feasible(G, H, sp)
+        return tour, pickup
 
-    # simulated annealing
-    current_solution = initial_solution
-    current_cost = cost(current_solution)
+    cur_cost = total_cost(current)
+    best = current.copy()
+    best_cost = cur_cost
 
-    best_solution = current_solution.copy()
-    best_cost = current_cost
+    T = 800.0
+    T_final = 0.5
+    cooling = 0.97
+    iters_per_T = 80
+    max_outer = 250  # caps runtime
 
-    T_initial = 1000.0  # initial temperature
-    T_final = 0.1  # final temperature
-    alpha_cooling = 0.95  # cooling rate (temperature *= alpha)
-    iterations_per_temp = 100  # iterations per temperature
-
-    T = T_initial
-    iteration = 0
-    max_iterations = 10000
-
-    #print("[SA] Starting simulated annealing...")
-    #print(f"[SA] Initial cost: {current_cost:.2f}")
-
-    while T > T_final and iteration < max_iterations:
-        for _ in range(iterations_per_temp):
-            new_solution = get_neighbor(current_solution)
-
-            if not is_feasible(new_solution):
+    for _ in range(max_outer):
+        for _ in range(iters_per_T):
+            cand = get_neighbor(current)
+            if not is_feasible(cand):
                 continue
-
-            new_cost = cost(new_solution)
-            delta_cost = new_cost - current_cost
-
-            if delta_cost < 0:
+            c_cost = total_cost(cand)
+            delta = c_cost - cur_cost
+            if delta <= 0:
                 accept = True
             else:
-                # accept with probability
-                probability = math.exp(-delta_cost / T)
-                accept = random.random() < probability
+                accept = random.random() < math.exp(-delta / max(T, 1e-9))
 
             if accept:
-                current_solution = new_solution
-                current_cost = new_cost
+                current = cand
+                cur_cost = c_cost
+                if cur_cost < best_cost - 1e-9:
+                    best = current.copy()
+                    best_cost = cur_cost
 
-                if current_cost < best_cost:
-                    best_solution = current_solution.copy()
-                    best_cost = current_cost
-                    # print(f"[SA] New best at T={T:.2f}: {best_cost:.2f}")
+        T *= cooling
+        if T < T_final:
+            break
 
-            iteration += 1
-
-        # cooling
-        T *= alpha_cooling
-
-    #print(f"[SA] Final best cost: {best_cost:.2f}")
-    #print(f"[SA] Total iterations: {iteration}")
-
-    tour = expand_tour(best_solution)
-    pick_up_locs_dict = get_pick_up_locs_dict(best_solution)
-
-    return tour, pick_up_locs_dict
+    m = _metrics(tuple(best))
+    tour = list(m.full_tour)
+    pickup = _build_pickup_dict_from_visited(set(m.visited), H, sp)
+    if m.infeasibility != 0:
+        return _fallback_feasible(G, H, sp)
+    return tour, pickup
 
 
-def ptp_solver(G: nx.DiGraph, H: list, alpha: float):
+# -----------------------------
+# Top-level orchestrator
+# -----------------------------
+
+
+def _summarize_best_costs(solutions: List[Tuple[str, bool, float, float, List[int], Dict[int, List[int]]]]):
     """
-    PTP solver.
+    Given a list of (name, legitimate, driving_cost, walking_cost, tour, pickup_dict),
+    aggregate the best (minimum total) solution per algorithm family.
+
+    Families:
+      - Greedy
+      - ILP
+      - SA   (min over SA, SA_1, SA_2, ...)
+      - MS   (min over MS, MS_1, MS_2, ...)
     """
-    node_num = G.number_of_nodes()
-    use_ILP = node_num <= 20
-    repeat_times = 20
-    # verbose = True
-    verbose = False
+    families = {"Greedy": [], "ILP": [], "SA": [], "MS": []}
+    for name, legit, drive, walk, tour, pick in solutions:
+        if name.startswith("SA"):
+            families["SA"].append((name, legit, drive, walk))
+        elif name.startswith("MS"):
+            families["MS"].append((name, legit, drive, walk))
+        elif name == "Greedy":
+            families["Greedy"].append((name, legit, drive, walk))
+        elif name == "ILP":
+            families["ILP"].append((name, legit, drive, walk))
+
+    best = {}
+    for fam, items in families.items():
+        if not items:
+            continue
+        legit_items = [it for it in items if it[1] is True]
+        pool = legit_items if legit_items else items  # fall back to best even if illegal
+        # minimize total
+        sel = min(pool, key=lambda it: (it[2] + it[3]))
+        best[fam] = {
+            "variant": sel[0],
+            "legitimate": bool(sel[1]),
+            "driving_cost": float(sel[2]),
+            "walking_cost": float(sel[3]),
+            "total_cost": float(sel[2] + sel[3]),
+        }
+    return best
+
+
+def _print_cost_report(best_costs: Dict[str, Dict], chosen: Optional[Tuple[str, bool, float, float]] = None):
+    """
+    Print a compact report of best costs per algorithm.
+    """
+    # Stable order
+    order = ["Greedy", "ILP", "SA", "MS"]
+    print("=== PTP Solver Cost Report (driving + walking) ===")
+    for fam in order:
+        if fam not in best_costs:
+            continue
+        b = best_costs[fam]
+        tag = "OK" if b["legitimate"] else "ILLEGAL"
+        print(
+            f"{fam:6s} | best={b['total_cost']:.6f} (drive={b['driving_cost']:.6f}, walk={b['walking_cost']:.6f})"
+            f" | variant={b['variant']} | {tag}"
+        )
+    if chosen is not None:
+        n, legit, drive, walk = chosen
+        print(
+            f"Chosen | {n} | total={drive+walk:.6f} (drive={drive:.6f}, walk={walk:.6f}) | "
+            + ("OK" if legit else "ILLEGAL")
+        )
+    print("===============================================")
+
+
+def ptp_solver(G: nx.DiGraph, H: list, alpha: float, report: bool = False, return_report: bool = False):
+    """
+    Main entry point. Tries:
+      - ILP for very small graphs,
+      - SA + Multi-start for robustness,
+      - Greedy as baseline,
+    then selects the best *legitimate* solution.
+    """
+    sp = ShortestPathCache(G)
+    node_num = sp.n
 
     solutions = []
 
-    if use_ILP:
-        IP_tour, IP_pick_up_locs_dict = ptp_solver_ILP(G, H, alpha)
-        IP_is_legitimate, IP_driving_cost, IP_walking_cost = analyze_solution(G, H, alpha, IP_tour, IP_pick_up_locs_dict)
-        solutions.append(("IP", IP_is_legitimate, IP_driving_cost, IP_walking_cost, IP_tour, IP_pick_up_locs_dict))
+    # Baselines
+    g_tour, g_pick = ptp_solver_greedy(G, H, alpha, sp=sp)
+    legit, drive, walk = analyze_solution(G, H, alpha, g_tour, g_pick)
+    solutions.append(("Greedy", legit, drive, walk, g_tour, g_pick))
 
-    GD_tour, GD_pick_up_locs_dict = ptp_solver_greedy(G, H, alpha)
-    GD_is_legitimate, GD_driving_cost, GD_walking_cost = analyze_solution(G, H, alpha, GD_tour, GD_pick_up_locs_dict)
-    solutions.append(("GD", GD_is_legitimate, GD_driving_cost, GD_walking_cost, GD_tour, GD_pick_up_locs_dict))
+    # ILP on small graphs
+    if node_num <= 20:
+        ilp_tour, ilp_pick = ptp_solver_ILP(G, H, alpha, time_limit=30, sp=sp)
+        legit, drive, walk = analyze_solution(G, H, alpha, ilp_tour, ilp_pick)
+        solutions.append(("ILP", legit, drive, walk, ilp_tour, ilp_pick))
 
-    for k in range(repeat_times):
-        SA_tour, SA_pick_up_locs_dict = ptp_solver_SA(G, H, alpha)
-        SA_is_legitimate, SA_driving_cost, SA_walking_cost = analyze_solution(G, H, alpha, SA_tour, SA_pick_up_locs_dict)
-        SA_name = f"SA_{k}" if k > 0 else "SA"
-        solutions.append((SA_name, SA_is_legitimate, SA_driving_cost, SA_walking_cost, SA_tour, SA_pick_up_locs_dict))
+    # Heuristic repeats (reduced adaptively for larger graphs)
+    repeats = 12 if node_num <= 150 else 6
+    for k in range(repeats):
+        sa_tour, sa_pick = ptp_solver_SA(G, H, alpha, sp=sp)
+        legit, drive, walk = analyze_solution(G, H, alpha, sa_tour, sa_pick)
+        name = f"SA_{k}" if k > 0 else "SA"
+        solutions.append((name, legit, drive, walk, sa_tour, sa_pick))
 
+        ms_tour, ms_pick = ptp_solver_multi_start(G, H, alpha, num_starts=8, sp=sp)
+        legit, drive, walk = analyze_solution(G, H, alpha, ms_tour, ms_pick)
+        name = f"MS_{k}" if k > 0 else "MS"
+        solutions.append((name, legit, drive, walk, ms_tour, ms_pick))
 
-        MS_tour, MS_pick_up_locs_dict = ptp_solver_multi_start(G, H, alpha)
-        MS_is_legitimate, MS_driving_cost, MS_walking_cost = analyze_solution(G, H, alpha, MS_tour, MS_pick_up_locs_dict)
-        MS_name = f"MS_{k}" if k > 0 else "MS"
-        solutions.append((MS_name, MS_is_legitimate, MS_driving_cost, MS_walking_cost, MS_tour, MS_pick_up_locs_dict))
+    # Keep only legitimate; otherwise fall back to guaranteed-feasible
+    legit_solutions = [s for s in solutions if s[1] is True]
+    if not legit_solutions:
+        tour, pickup = _fallback_feasible(G, H, sp)
+        # fallback is constructed to be legitimate, but we still use the official evaluator for costs
+        fb_legit, fb_drive, fb_walk = analyze_solution(G, H, alpha, tour, pickup)
+        if report or return_report:
+            best_costs = _summarize_best_costs(solutions)
+            if report:
+                _print_cost_report(best_costs, chosen=("Fallback", fb_legit, fb_drive, fb_walk))
+            if return_report:
+                return tour, pickup, best_costs
+        return tour, pickup
 
-    solutions.sort(key=lambda x: x[2] + x[3]) # sort by total cost
+    legit_solutions.sort(key=lambda x: x[2] + x[3])  # total cost
+    best = legit_solutions[0]
+    # Reporting (optional)
+    if report or return_report:
+        best_costs = _summarize_best_costs(solutions)
+        if report:
+            _print_cost_report(best_costs, chosen=(best[0], best[1], best[2], best[3]))
+        if return_report:
+            return best[4], best[5], best_costs
+    return best[4], best[5]
 
-
-    if verbose:
-        print("=" * 70)
-        print(f"{'Method':<6} | {'Legit':<9} | {'Driving Cost':>13} | {'Walking Cost':>13} | {'Total Cost':>11}")
-        for solution in solutions:
-            print(f"{solution[0]:<6} | {str(solution[1]):<9} | {solution[2]:13.3f} | {solution[3]:13.3f} | {(solution[2] + solution[3]):11.3f}")
-        print("-" * 70)
-        print(f"[Best method] {solutions[0][0]}")
-        print("=" * 70)
-
-    return solutions[0][4], solutions[0][5]
 
 if __name__ == "__main__":
     pass
